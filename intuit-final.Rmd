@@ -1,0 +1,251 @@
+---
+title: Intuit Quickbooks Upgrade
+output: html_document
+---
+
+
+```{r r_setup, include = FALSE}
+## initial settings
+knitr::opts_chunk$set(
+  comment = NA,
+  echo = TRUE,
+  error = TRUE,
+  cache = FALSE,
+  message = FALSE,
+  dpi = 96,
+  warning = FALSE
+)
+
+## width to use when printing tables etc.
+options(
+  width = 250,
+  scipen = 100,
+  max.print = 5000,
+  stringsAsFactors = FALSE
+)
+
+## load radiant packages if needed
+if (!exists("r_environment")) library(radiant)
+```
+
+<style>
+.table {
+  width: auto;
+}
+ul, ol {
+  padding-left: 18px;
+}
+pre, code, pre code {
+  overflow: auto;
+  white-space: pre;
+  word-wrap: normal;
+  background-color: #ffffff;
+}
+</style>
+
+## Setup
+
+
+```{r}
+## loading the data. Note that data must be loaded from Dropbox/MGTA455-2018/data
+intuit75k_wrk <- readr::read_rds(file.path(find_dropbox(), "MGTA455-2018/data/intuit75k.rds"))
+library(dplyr)
+##install.packages("pROC")
+library(pROC)
+## Recall that Radiant stores all datasets in a list called r_data 
+## if you are planning to use data transformation commands generated 
+## in Radiant uncomment the lines below and comment out the line above
+r_data <- list()
+r_data[["intuit75k_wrk"]] <- readr::read_rds(file.path(find_dropbox(), "MGTA455-2018/data/intuit75k.rds"))
+```
+
+## Assign New Zip Bins and Separate into Train and Valid
+
+Create a new zip code bin variable based on response rate of different zip code(before we divide bins, we firstly adjust zip code by getting rid of the last three digits (floor(zipcode/1000))  to make sure the response rate in each zip code is not too small. The motivation of creating new zip code bin is that when we plot response rate for the equal size bin from original data, the first group bin has the dramatical high response rate compared with other group bins. Therefore, based on the nature of zip code, we think people in different area(zip code) will respond differently. 
+
+```{r}
+r_data[["intuit75k_wrk"]]$zipcut<-floor(as.numeric(r_data[["intuit75k_wrk"]]$zip)/1000)
+
+ziptable<-r_data[["intuit75k_wrk"]] %>%filter(training==1)%>% 
+  group_by(zipcut) %>% 
+  mutate(zipresp=mean(res1=="Yes")) %>% 
+  ungroup %>%
+  mutate(newzipbin=xtile(zipresp,20)) %>% 
+  group_by(zipcut) %>% summarize(newzipbin=mean(newzipbin))
+
+# new_cut_zip<-r_data[["intuit75k_wrk"]] %>%
+
+r_data[["intuit75k_wrk"]]<-r_data[["intuit75k_wrk"]] %>% left_join(ziptable, by=("zipcut"))
+r_data[["intuit75k_wrk"]][is.na(r_data[["intuit75k_wrk"]])] <- 10
+
+train_data<- r_data[["intuit75k_wrk"]] %>% filter(training==1)
+valid_data<- r_data[["intuit75k_wrk"]] %>% filter(training==0)
+break_even <- 1.41/60
+```
+
+## Model Building
+
+### RFMsq (rfm_sq_pred)
+
+Based on recency, frequency and monetary, we grouped customers in sequential orders using full data set and then calculate response rate using training dataset. After left-joining the predicted response rate, we can get the validation dataset for RFM model. And then we calculate accuracy, kappa, profit, ROME, contact and AUC using validation data.
+
+```{r}
+
+r_data[["intuit75k_wrk"]]<-r_data[["intuit75k_wrk"]] %>%
+  mutate(rec_sq=xtile(last,5)) %>%
+  group_by(rec_sq) %>%
+  mutate(freq_sq=xtile(numords,5,rev = TRUE)) %>%
+  ungroup() %>%
+  group_by(rec_sq,freq_sq) %>%
+  mutate(mon_sq=xtile(dollars,5,rev = TRUE)) %>%
+  mutate(rfm_sq=paste0(rec_sq,freq_sq,mon_sq)) %>%
+  ungroup()
+
+rfm_table<-r_data[["intuit75k_wrk"]] %>%filter(training==1) %>% group_by(rfm_sq) %>%
+  summarize(pred_rfm_sq=(mean(res1=="Yes")))
+
+rfm_valid_data<- r_data[["intuit75k_wrk"]] %>% filter(training==0)
+
+rfm_valid_data<-rfm_valid_data %>% left_join(rfm_table, by=("rfm_sq"))
+valid_data$rfm_sq_pred<-rfm_valid_data$pred_rfm_sq
+```
+
+## Naive Bayes (nb_pred)
+
+By using the training dataset which we already filter training to 1, we build up naive bayes model with all the variables. And then we predict it with validation data. Applying confusion function from radiant, we can get accuracy, kappa, profit, ROME, contact and AUC.
+
+```{r}
+result_nb <- nb(
+  dataset = "train_data", 
+  rvar = "res1", 
+  evar = c(
+    "zip_bins", "sex", "bizflag", "numords", "dollars", "last", 
+    "sincepurch", "version1", "owntaxprod", "upgraded"))
+
+valid_data$nb_pred <- predict(result_nb, pred_data = "valid_data")[["Yes"]]
+```
+
+##from here, by looking at the p-value, we can see that significant variables are zip_bins, numords, dollars, last, version1, owntaxprod, upgraded.
+##then leave with 7 variables from below and then we tried different iteractions and then add back variables from the previous model. 
+##the final logistic model is as follows:
+
+## Logistic Regression (log_pred, log_lb_pred)
+Logistic Model with original zip bins
+Firstly, we input all the variables into logistic model with train data and then by looking at the p-value, we can see that significant variables are zip_bins, numords, dollars, last, version1, owntaxprod, upgraded. This leaves us with 7 variables from below and then we tried different interactions and then add back variables from the previous model.
+
+
+Logistic Model with new zip bins(Final Model for Logistic Model)
+After creating the new zip bins variable, we did the same thing with new logistic model and then tried add back variables and interactions to new model which return highest profit and AUC. In this model, we added following interactions into the model:
+“Sex:zip_bins”; “zip_bins:numords"; "zip_bins:last"; "zip_bins:dollars"; "numords:dollars"; "numords:owntaxprod"; "version1:zip_bins";"sex:numords";"numords:upgraded"
+
+The reasons of adding those interactions are as follows:
+Since our newbins contains geographical features and geographical data may have differences of sex distribution. In psychological study, male and female have different purchasing behavior and they also have different income level. Therefore, we add “sex:zip_bins”,”zip_bins:numords”, “zip_bins:last”, “zip_bins:dollars” and "sex:numords". Moreover, in general, number of orders and total dollar spent are positively correlated, therefore, we suspect there is an interaction between those two. And then people tend to make purchasing behavior if they had similar purchasing experience before, so if customer used to by tax product by themselves before, they are likely to make purchase again, therefore, we add interaction “numords:owntaxprod” into the model as well. Furthermore, for some of customers, they choose not to upgrade their software because they want to purchase new software. So we put interaction “numords:upgraded” into the model. In the end, for those of customers who have version 2 software, they are likely to to have higher income level and therefore have relationship with geographical features in zip_bins. 
+
+```{r}
+result_logistic_test <- logistic(
+  dataset = "train_data", 
+  rvar = "res1", 
+  evar = c(
+   "zip_bins", "numords", "dollars", "last", "version1", 
+    "owntaxprod", "upgraded","sex"), 
+  int = c("sex:zip_bins","zip_bins:numords","zip_bins:last","zip_bins:dollars","numords:dollars","numords:owntaxprod","version1:zip_bins"), 
+  lev = "Yes")
+
+pred_logistic_test <- predict(result_logistic_test, pred_data = "valid_data",conf_lev = 0.9)
+valid_data$log_pred<-pred_logistic_test[["Prediction"]]
+valid_data$log_lb_pred<-pred_logistic_test[["5%"]]
+```
+
+## Neural Network (nn_pred)
+
+```{r}
+result_old_nn <- ann(
+  dataset = "train_data", 
+  rvar = "res1", 
+  evar = c(
+    "zip_bins", "sex", "bizflag", "numords", "dollars", "last", 
+    "sincepurch", "version1", "owntaxprod", "upgraded"
+  ), 
+  lev = "Yes", 
+  size = 11, 
+  seed = 1234
+)
+pred_old_nn <- predict(result_old_nn, pred_data = "valid_data")
+valid_data$pred_old_nn<-pred_old_nn[["Prediction"]]
+
+```
+
+How we decide the size and decay rate:
+
+We did a simulation for decay rate from 0.2 to 0.9 and sizes from 1 to 13 with respect to profit. 
+We see that from the graph that, the light blue(higher decay rate) dots are more close to each other and dark blue(lower decay rate) dots are more separate from each other. In both cases(light and dark blue dots) we all have see a increasing trend as the sizes goes up all the way to 11 and started to decrease as sizes goes higher than 11. Thus, regardless the decay rate, we choose size of 11 to be number we are going to use in our case. 
+Then, Since higher decay rate has less difference(separation) from each other, it is more stable and accurate for the model rather than the lower decay rate dots. So we choose to have 0.8 as our decay rate.
+
+```{r}
+tests<-readRDS("tests.rds")
+tests %>% ggplot() + geom_point(aes(x=sizes, y=profits, color=decay),stat="identity",position="jitter") +ggtitle("Relationship Between Size, Decay and Profit")
+```
+
+For 100 bootstrap, we first choose a 52500 random sample with replacement to get a full list of prediction of 75000 id. Then we applied all the models to the predicted. The purpose of applying all datasets first is to check whether overfitting is involved by comparing the AUC indicators of predicting result. But for comparison with other models, we selected validation data to calculate the profit based on the bootstrap.
+
+```{r, eval=FALSE, echo=TRUE}
+## This Chunk Performs Bootstrap and will not be evaluated in the Report
+dat_ann <- r_data[["intuit75k_wrk"]]%>% select(id)
+r_data[["intuit75k_train"]] <- r_data[["intuit75k_wrk"]]%>%filter(training==1)
+r_data[["intuit75k_test"]] <- r_data[["intuit75k_wrk"]]%>%filter(training==0)
+for (i in 1:100){
+  r_data[["train"]] <- sample_n(r_data[["intuit75k_train"]],52500,replace = T)
+  result <- ann(
+  dataset = "train", 
+  rvar = "res1", 
+  evar = c(
+    "newzipbin", "sex", "bizflag", "numords", "dollars", "last", 
+    "sincepurch", "version1", "owntaxprod", "upgraded"), 
+  lev = "Yes",
+  size = 11,
+  decay = 0.8,
+  seed = 1234)
+  
+  pred <- predict(result, pred_data = "intuit75k_wrk")
+  store(pred, data = "intuit75k_wrk", name = "predict_ann")
+  predict_dat <- r_data[["intuit75k_wrk"]]%>%select(id,predict_ann)
+  dat_ann <- dat_ann %>% left_join(predict_dat,"id")}
+colnames(dat_ann) <- c("id",paste(rep("predict_ann",100),1:100))
+dat_ann$quantile <- NA
+for (i in 1:nrow(dat_ann)){
+  dat_ann$quantile[i] <- as.numeric(quantile(as.numeric(dat_ann[i,2:101]),0.1))
+}
+```
+
+```{r}
+## This code chunk imports the evaluated result of the previous chunk
+dat_ann <- readRDS("ann_100_newbin.rds")
+valid_data$nn_pred <- (dat_ann %>%select(id,quantile) %>%inner_join(valid_data,by=("id")))[["quantile"]]
+```
+
+## Model Comparison
+```{r, fig.height = 15}
+models<<-c("rfm_sq_pred","nb_pred","log_pred","log_lb_pred","pred_old_nn","nn_pred")
+conf <- confusion(
+  dataset = "valid_data", 
+  pred = models,
+  rvar = "res1", 
+  lev = "Yes", 
+  cost = 1.41, 
+  margin = 60, 
+  train = "All")
+
+eval <- evalbin(
+  dataset = "valid_data", 
+  pred = models,
+  rvar = "res1", 
+  lev = "Yes", 
+  cost = 1.41, 
+  margin = 60, 
+  train = "All")
+
+plot(conf, custom = FALSE)
+plot(eval, plots = c("lift", "gains", "profit", "rome"), custom =F)
+```
+
+Model comparison and conclusion: From the plot above, we see that our new NN model(the one with new zipbins) still have the best performance over all attributes(profit,kappa,AUC) and there is not space for improvment for our logistic model at this moment, so we choose to use NN with newzipbins instead of the old zip bin NN model.
